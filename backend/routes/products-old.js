@@ -244,3 +244,90 @@ router.delete('/:productId', async (req, res) => {
 });
 
 module.exports = router;
+
+// Get low stock products
+router.get('/alerts/low-stock', async (req, res) => {
+  try {
+    const { data, error } = await req.supabase
+      .from('products')
+      .select('*')
+      .lt('quantity', 'min_stock_level')
+      .order('quantity', { ascending: true });
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      data: data,
+      count: data.length
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch low stock products',
+      error: error.message
+    });
+  }
+});
+
+// Update stock quantity
+router.patch('/:id/stock', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantity, operation = 'set' } = req.body; // operation: 'set', 'add', 'subtract'
+
+    if (quantity === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'Quantity is required'
+      });
+    }
+
+    let updateQuery;
+    
+    if (operation === 'add') {
+      updateQuery = req.supabase.rpc('increment_stock', { 
+        product_id: id, 
+        amount: quantity 
+      });
+    } else if (operation === 'subtract') {
+      updateQuery = req.supabase.rpc('decrement_stock', { 
+        product_id: id, 
+        amount: quantity 
+      });
+    } else {
+      // Set operation
+      updateQuery = req.supabase
+        .from('products')
+        .update({
+          quantity: quantity,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id)
+        .select()
+        .single();
+    }
+
+    const { data, error } = await updateQuery;
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: 'Stock updated successfully',
+      data: data
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update stock',
+      error: error.message
+    });
+  }
+});
+
+module.exports = router;

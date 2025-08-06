@@ -1,13 +1,16 @@
 const express = require('express');
 const router = express.Router();
 
-// Get all categories
+// Get all categories for a tenant
 router.get('/', async (req, res) => {
   try {
+    const tenantId = req.tenantId;
+
     const { data, error } = await req.supabase
       .from('categories')
       .select('*')
-      .order('name', { ascending: true });
+      .eq('tenant_id', tenantId)
+      .order('name');
 
     if (error) {
       throw error;
@@ -15,7 +18,8 @@ router.get('/', async (req, res) => {
 
     res.json({
       success: true,
-      data: data
+      data: data || [],
+      tenant: req.tenant.org_name
     });
   } catch (error) {
     res.status(500).json({
@@ -26,15 +30,17 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get category by ID
+// Get a specific category for a tenant
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const tenantId = req.tenantId;
 
     const { data, error } = await req.supabase
       .from('categories')
       .select('*')
-      .eq('id', id)
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId)
       .single();
 
     if (error) {
@@ -50,7 +56,7 @@ router.get('/:id', async (req, res) => {
 
     res.json({
       success: true,
-      data: data
+      data
     });
   } catch (error) {
     res.status(500).json({
@@ -61,10 +67,11 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Create new category
+// Create a new category for a tenant
 router.post('/', async (req, res) => {
   try {
     const { name, description } = req.body;
+    const tenantId = req.tenantId;
 
     if (!name) {
       return res.status(400).json({
@@ -73,14 +80,32 @@ router.post('/', async (req, res) => {
       });
     }
 
+    // Check if category already exists for this tenant
+    const { data: existingCategory, error: checkError } = await req.supabase
+      .from('categories')
+      .select('category_id')
+      .eq('tenant_id', tenantId)
+      .eq('name', name.trim())
+      .single();
+
+    if (checkError && checkError.code !== 'PGRST116') { // PGRST116 = no rows returned
+      throw checkError;
+    }
+
+    if (existingCategory) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category with this name already exists'
+      });
+    }
+
     const { data, error } = await req.supabase
       .from('categories')
-      .insert({
-        name,
-        description,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
+      .insert([{
+        tenant_id: tenantId,
+        name: name.trim(),
+        description: description?.trim() || null
+      }])
       .select()
       .single();
 
@@ -91,7 +116,7 @@ router.post('/', async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'Category created successfully',
-      data: data
+      data
     });
   } catch (error) {
     res.status(500).json({
@@ -102,20 +127,49 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Update category
+// Update a category for a tenant
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description } = req.body;
+    const tenantId = req.tenantId;
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category name is required'
+      });
+    }
+
+    // Check if another category with the same name exists for this tenant
+    const { data: existingCategory, error: checkError } = await req.supabase
+      .from('categories')
+      .select('category_id')
+      .eq('tenant_id', tenantId)
+      .eq('name', name.trim())
+      .neq('category_id', id)
+      .single();
+
+    if (checkError && checkError.code !== 'PGRST116') {
+      throw checkError;
+    }
+
+    if (existingCategory) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category with this name already exists'
+      });
+    }
 
     const { data, error } = await req.supabase
       .from('categories')
       .update({
-        name,
-        description,
+        name: name.trim(),
+        description: description?.trim() || null,
         updated_at: new Date().toISOString()
       })
-      .eq('id', id)
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId)
       .select()
       .single();
 
@@ -133,7 +187,7 @@ router.put('/:id', async (req, res) => {
     res.json({
       success: true,
       message: 'Category updated successfully',
-      data: data
+      data
     });
   } catch (error) {
     res.status(500).json({
@@ -144,41 +198,53 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// Delete category
+// Delete a category for a tenant
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const tenantId = req.tenantId;
 
-    // Check if category has products
-    const { data: products, error: checkError } = await req.supabase
+    // Check if category is being used by any products
+    const { count: productCount, error: countError } = await req.supabase
       .from('products')
-      .select('id')
-      .eq('category', id)
-      .limit(1);
+      .select('*', { count: 'exact', head: true })
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId);
 
-    if (checkError) {
-      throw checkError;
+    if (countError) {
+      throw countError;
     }
 
-    if (products && products.length > 0) {
+    if (productCount > 0) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot delete category with existing products'
+        message: `Cannot delete category. It is being used by ${productCount} product(s)`
       });
     }
 
-    const { error } = await req.supabase
+    const { data, error } = await req.supabase
       .from('categories')
       .delete()
-      .eq('id', id);
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId)
+      .select()
+      .single();
 
     if (error) {
       throw error;
     }
 
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Category not found'
+      });
+    }
+
     res.json({
       success: true,
-      message: 'Category deleted successfully'
+      message: 'Category deleted successfully',
+      data
     });
   } catch (error) {
     res.status(500).json({
@@ -189,19 +255,18 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// Get products in category
+// Get products by category for a tenant
 router.get('/:id/products', async (req, res) => {
   try {
     const { id } = req.params;
-    const { page = 1, limit = 10 } = req.query;
-    const offset = (page - 1) * limit;
+    const tenantId = req.tenantId;
 
-    const { data, error, count } = await req.supabase
+    const { data, error } = await req.supabase
       .from('products')
-      .select('*', { count: 'exact' })
-      .eq('category', id)
-      .range(offset, offset + limit - 1)
-      .order('created_at', { ascending: false });
+      .select('*')
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId)
+      .order('name');
 
     if (error) {
       throw error;
@@ -209,18 +274,72 @@ router.get('/:id/products', async (req, res) => {
 
     res.json({
       success: true,
-      data: data,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: count,
-        totalPages: Math.ceil(count / limit)
+      data: data || []
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch products for category',
+      error: error.message
+    });
+  }
+});
+
+// Get category statistics for a tenant
+router.get('/:id/stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tenantId = req.tenantId;
+
+    // Get product count for this category
+    const { count: productCount, error: productError } = await req.supabase
+      .from('products')
+      .select('*', { count: 'exact', head: true })
+      .eq('category_id', id)
+      .eq('tenant_id', tenantId);
+
+    if (productError) {
+      throw productError;
+    }
+
+    // Get total inventory for this category
+    const { data: inventoryData, error: inventoryError } = await req.supabase
+      .from('inventory')
+      .select(`
+        quantity,
+        products:product_id (
+          category_id,
+          purchase_price
+        )
+      `)
+      .eq('tenant_id', tenantId);
+
+    if (inventoryError) {
+      throw inventoryError;
+    }
+
+    // Filter by category and calculate totals
+    const categoryInventory = inventoryData.filter(item => 
+      item.products?.category_id === parseInt(id)
+    );
+    
+    const totalQuantity = categoryInventory.reduce((sum, item) => sum + item.quantity, 0);
+    const totalValue = categoryInventory.reduce((sum, item) => {
+      return sum + (item.quantity * (item.products?.purchase_price || 0));
+    }, 0);
+
+    res.json({
+      success: true,
+      data: {
+        productCount: productCount || 0,
+        totalQuantity: totalQuantity || 0,
+        totalValue: Math.round(totalValue * 100) / 100
       }
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch category products',
+      message: 'Failed to fetch category statistics',
       error: error.message
     });
   }

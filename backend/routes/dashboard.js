@@ -1,32 +1,49 @@
 const express = require('express');
 const router = express.Router();
 
-// Get dashboard statistics
+// Get dashboard statistics for a tenant
 router.get('/stats', async (req, res) => {
   try {
+    const tenantId = req.tenantId;
+
     // Get total products count
     const { count: totalProducts, error: productsError } = await req.supabase
       .from('products')
-      .select('*', { count: 'exact', head: true });
+      .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId);
 
     if (productsError) {
       throw productsError;
     }
 
-    // Get low stock products (quantity < min_stock_level)
-    const { data: lowStockProducts, error: lowStockError } = await req.supabase
-      .from('products')
-      .select('id')
-      .lt('quantity', 'min_stock_level');
+    // Get total inventory quantity
+    const { data: inventoryData, error: inventoryError } = await req.supabase
+      .from('inventory')
+      .select('quantity')
+      .eq('tenant_id', tenantId);
+
+    if (inventoryError) {
+      throw inventoryError;
+    }
+
+    const totalInventory = inventoryData.reduce((sum, item) => sum + item.quantity, 0);
+
+    // Get low stock items (quantity < 10)
+    const { data: lowStockData, error: lowStockError } = await req.supabase
+      .from('inventory')
+      .select('quantity')
+      .eq('tenant_id', tenantId)
+      .lt('quantity', 10);
 
     if (lowStockError) {
       throw lowStockError;
     }
 
-    // Get out of stock products (quantity = 0)
+    // Get out of stock items (quantity = 0)
     const { count: outOfStock, error: outOfStockError } = await req.supabase
-      .from('products')
+      .from('inventory')
       .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId)
       .eq('quantity', 0);
 
     if (outOfStockError) {
@@ -34,46 +51,60 @@ router.get('/stats', async (req, res) => {
     }
 
     // Get total inventory value
-    const { data: products, error: valueError } = await req.supabase
-      .from('products')
-      .select('quantity, price');
+    const { data: inventoryWithProducts, error: valueError } = await req.supabase
+      .from('inventory')
+      .select(`
+        quantity,
+        products:product_id (
+          purchase_price
+        )
+      `)
+      .eq('tenant_id', tenantId);
 
     if (valueError) {
       throw valueError;
     }
 
-    const totalValue = products.reduce((sum, product) => {
-      return sum + (product.quantity * product.price);
+    const totalValue = inventoryWithProducts.reduce((sum, item) => {
+      return sum + (item.quantity * (item.products?.purchase_price || 0));
     }, 0);
 
-    // Get categories count
-    const { count: totalCategories, error: categoriesError } = await req.supabase
-      .from('categories')
-      .select('*', { count: 'exact', head: true });
+    // Get recent sales count (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    if (categoriesError) {
-      throw categoriesError;
+    const { count: recentSales, error: salesError } = await req.supabase
+      .from('sales')
+      .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId)
+      .gte('created_at', thirtyDaysAgo.toISOString());
+
+    if (salesError) {
+      throw salesError;
     }
 
-    // Get suppliers count
-    const { count: totalSuppliers, error: suppliersError } = await req.supabase
-      .from('suppliers')
-      .select('*', { count: 'exact', head: true });
+    // Get total users count for this tenant
+    const { count: totalUsers, error: usersError } = await req.supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId);
 
-    if (suppliersError) {
-      throw suppliersError;
+    if (usersError) {
+      throw usersError;
     }
 
     res.json({
       success: true,
       data: {
         totalProducts: totalProducts || 0,
-        lowStock: lowStockProducts ? lowStockProducts.length : 0,
+        totalInventory: totalInventory || 0,
+        lowStock: lowStockData ? lowStockData.length : 0,
         outOfStock: outOfStock || 0,
         totalValue: Math.round(totalValue * 100) / 100,
-        totalCategories: totalCategories || 0,
-        totalSuppliers: totalSuppliers || 0
-      }
+        recentSales: recentSales || 0,
+        totalUsers: totalUsers || 0
+      },
+      tenant: req.tenant.org_name
     });
   } catch (error) {
     res.status(500).json({
@@ -84,22 +115,50 @@ router.get('/stats', async (req, res) => {
   }
 });
 
-// Get recent activities (last 10 product updates)
+// Get recent activities for a tenant
 router.get('/recent-activity', async (req, res) => {
   try {
-    const { data, error } = await req.supabase
-      .from('products')
-      .select('id, name, sku, updated_at, quantity')
-      .order('updated_at', { ascending: false })
+    const tenantId = req.tenantId;
+
+    // Get recent sales
+    const { data: recentSales, error: salesError } = await req.supabase
+      .from('sales')
+      .select(`
+        sale_id,
+        quantity,
+        selling_price,
+        created_at,
+        products:product_id (
+          name,
+          brand
+        )
+      `)
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false })
       .limit(10);
 
-    if (error) {
-      throw error;
+    if (salesError) {
+      throw salesError;
+    }
+
+    // Get recent product additions
+    const { data: recentProducts, error: productsError } = await req.supabase
+      .from('products')
+      .select('product_id, name, brand, created_at')
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    if (productsError) {
+      throw productsError;
     }
 
     res.json({
       success: true,
-      data: data || []
+      data: {
+        recentSales: recentSales || [],
+        recentProducts: recentProducts || []
+      }
     });
   } catch (error) {
     res.status(500).json({
@@ -110,26 +169,51 @@ router.get('/recent-activity', async (req, res) => {
   }
 });
 
-// Get top products by value
+// Get top products by sales volume for a tenant
 router.get('/top-products', async (req, res) => {
   try {
     const { limit = 5 } = req.query;
+    const tenantId = req.tenantId;
 
     const { data, error } = await req.supabase
-      .from('products')
-      .select('id, name, sku, quantity, price')
-      .order('price', { ascending: false })
-      .limit(parseInt(limit));
+      .from('sales')
+      .select(`
+        product_id,
+        quantity,
+        products:product_id (
+          name,
+          brand,
+          purchase_price,
+          mrp
+        )
+      `)
+      .eq('tenant_id', tenantId);
 
     if (error) {
       throw error;
     }
 
-    // Calculate total value for each product
-    const topProducts = data.map(product => ({
-      ...product,
-      totalValue: product.quantity * product.price
-    }));
+    // Aggregate sales by product
+    const productSales = data.reduce((acc, sale) => {
+      const productId = sale.product_id;
+      if (!acc[productId]) {
+        acc[productId] = {
+          product_id: productId,
+          name: sale.products?.name,
+          brand: sale.products?.brand,
+          purchase_price: sale.products?.purchase_price,
+          mrp: sale.products?.mrp,
+          totalQuantitySold: 0
+        };
+      }
+      acc[productId].totalQuantitySold += sale.quantity;
+      return acc;
+    }, {});
+
+    // Sort by quantity sold and take top products
+    const topProducts = Object.values(productSales)
+      .sort((a, b) => b.totalQuantitySold - a.totalQuantitySold)
+      .slice(0, parseInt(limit));
 
     res.json({
       success: true,
@@ -144,51 +228,26 @@ router.get('/top-products', async (req, res) => {
   }
 });
 
-// Get products by category distribution
-router.get('/category-distribution', async (req, res) => {
-  try {
-    const { data: products, error } = await req.supabase
-      .from('products')
-      .select('category');
-
-    if (error) {
-      throw error;
-    }
-
-    // Count products by category
-    const distribution = products.reduce((acc, product) => {
-      const category = product.category || 'Uncategorized';
-      acc[category] = (acc[category] || 0) + 1;
-      return acc;
-    }, {});
-
-    // Convert to array format
-    const categoryData = Object.entries(distribution).map(([category, count]) => ({
-      category,
-      count
-    }));
-
-    res.json({
-      success: true,
-      data: categoryData
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch category distribution',
-      error: error.message
-    });
-  }
-});
-
-// Get stock alerts
+// Get inventory alerts for a tenant
 router.get('/alerts', async (req, res) => {
   try {
-    // Get low stock products
+    const tenantId = req.tenantId;
+
+    // Get low stock items
     const { data: lowStock, error: lowStockError } = await req.supabase
-      .from('products')
-      .select('id, name, sku, quantity, min_stock_level')
-      .lt('quantity', 'min_stock_level')
+      .from('inventory')
+      .select(`
+        product_id,
+        location,
+        quantity,
+        capacity,
+        products:product_id (
+          name,
+          brand
+        )
+      `)
+      .eq('tenant_id', tenantId)
+      .lt('quantity', 10)
       .gt('quantity', 0)
       .order('quantity', { ascending: true });
 
@@ -196,10 +255,19 @@ router.get('/alerts', async (req, res) => {
       throw lowStockError;
     }
 
-    // Get out of stock products
+    // Get out of stock items
     const { data: outOfStock, error: outOfStockError } = await req.supabase
-      .from('products')
-      .select('id, name, sku, quantity')
+      .from('inventory')
+      .select(`
+        product_id,
+        location,
+        quantity,
+        products:product_id (
+          name,
+          brand
+        )
+      `)
+      .eq('tenant_id', tenantId)
       .eq('quantity', 0)
       .order('updated_at', { ascending: false });
 
